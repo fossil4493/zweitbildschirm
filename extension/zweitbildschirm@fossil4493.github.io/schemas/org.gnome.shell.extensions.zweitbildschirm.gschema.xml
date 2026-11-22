@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.zweitbildschirm" path="/org/gnome/shell/extensions/zweitbildschirm/">
+    <key name="active" type="b">
+      <default>false</default>
+      <summary>Tablet-Bildschirm eingeschaltet (Schalter in den Schnelleinstellungen)</summary>
+    </key>
+
+    <!-- Grundfunktion -->
+    <key name="tablet-sound" type="b">
+      <default>true</default>
+      <summary>Tonausgabegerät „Tablet“ anbieten, solange ein Tablet verbunden ist</summary>
+    </key>
+    <key name="restore-windows" type="b">
+      <default>true</default>
+      <summary>Fenster nach einem Verbindungsabbruch zurück aufs Tablet holen</summary>
+    </key>
+    <key name="remember-layout" type="b">
+      <default>true</default>
+      <summary>Anordnung und Skalierung der Bildschirme je Monitor-Kombination merken</summary>
+    </key>
+    <key name="animate-transitions" type="b">
+      <default>true</default>
+      <summary>Weicher Übergang, während Bildschirme und Fenster neu angeordnet werden</summary>
+    </key>
+    <key name="notifications" type="b">
+      <default>true</default>
+      <summary>Hinweise anzeigen</summary>
+    </key>
+
+    <!-- Optional: Firewall-Helfer -->
+    <key name="firewall-auto" type="b">
+      <default>false</default>
+      <summary>Port 3389 automatisch für freigegebene Geräte öffnen (Firewall-Helfer nötig)</summary>
+    </key>
+
+    <!-- Optional: Android-Automatik über adb -->
+    <key name="adb-enabled" type="b">
+      <default>false</default>
+      <summary>Android-Automatik über adb (Entwickleroptionen am Tablet nötig)</summary>
+    </key>
+    <key name="adb-path" type="s">
+      <default>''</default>
+      <summary>Pfad zu adb (leer = suchen)</summary>
+    </key>
+    <key name="tablet-serial" type="s">
+      <default>''</default>
+      <summary>Seriennummer des Tablets (leer = erstes gefundenes Gerät)</summary>
+    </key>
+    <key name="tablet-app" type="s">
+      <choices><choice value="vento"/><choice value="microsoft"/><choice value="none"/></choices>
+      <default>'vento'</default>
+      <summary>App, die auf dem Tablet geöffnet wird</summary>
+    </key>
+    <key name="auto-connect" type="b">
+      <default>true</default>
+      <summary>Vento verbindet sich von selbst</summary>
+    </key>
+    <key name="wlan-enabled" type="b">
+      <default>true</default>
+      <summary>Über WLAN verbinden, wenn kein Kabel steckt</summary>
+    </key>
+    <key name="cable-while-wlan" type="s">
+      <choices><choice value="keep"/><choice value="switch"/></choices>
+      <default>'switch'</default>
+      <summary>Kabel angesteckt während einer WLAN-Sitzung</summary>
+    </key>
+    <key name="lock-tablet" type="b">
+      <default>false</default>
+      <summary>Tablet sperren, wenn der Laptop gesperrt wird</summary>
+    </key>
+    <key name="wake-tablet" type="b">
+      <default>false</default>
+      <summary>Tablet aufwecken, wenn der Laptop entsperrt wird</summary>
+    </key>
+  </schema>
+</schemalist>

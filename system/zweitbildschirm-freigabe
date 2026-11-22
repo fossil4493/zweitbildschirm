@@ -1,0 +1,8 @@
+#!/bin/bash
+# Gibt das Gerät mit dieser IPv4-Adresse (seine MAC im lokalen Netz) für den
+# Tablet-Zweitbildschirm frei. Eigene polkit-Aktion: verlangt immer das Admin-Passwort.
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+HIER=$(dirname "$(readlink -f "$0")")
+ZB_FREIGABE=1 "$HIER/zweitbildschirm-firewall" lernen "${1:-}"
+exec "$HIER/zweitbildschirm-firewall" open

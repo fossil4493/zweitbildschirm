@@ -1,0 +1,4 @@
+build/
+vento/*.apk
+__pycache__/
+gschemas.compiled

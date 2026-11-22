@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""Automatik für den Tablet-Zweitbildschirm (systemd-Benutzerdienst).
+
+Einstellungen: GNOME-Erweiterung „Tablet-Zweitbildschirm“ → Einstellungen
+(GSettings org.gnome.shell.extensions.zweitbildschirm).
+
+- Tablet per USB (adb): RDP-Server an, Port 3389 per adb-Tunnel durchreichen
+  (Vento verbindet sich mit 127.0.0.1:3389). Kein Firewall-Port offen.
+- Nur per WLAN erreichbar (kabelloses Debugging, dient nur zur Steuerung):
+  Firewall-Helfer öffnet Port 3389 zur Laufzeit NUR für die Adresse des Tablets;
+  Vento verbindet sich direkt (TLS + Passwort) mit der WLAN-Adresse des Laptops.
+  Die Verbindung „Laptop (WLAN)“ in Vento wird dafür automatisch angelegt/angepasst.
+- Wechsel Kabel <-> WLAN: neuer Weg wird eingerichtet, Vento verbindet sich neu.
+- Tablet ganz weg: nach der Wartezeit Server aus, Firewall-Regel weg.
+- Solange das Tablet verbunden ist, gibt es das Tonausgabegerät „Tablet“.
+"""
+import json, os, re, signal, subprocess, sys, time
+from xml.sax.saxutils import escape
+import gi
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio
+
+ADB = os.path.expanduser("~/.local/bin/adb")
+LAYOUT = os.path.expanduser("~/.local/bin/zweitbildschirm-layout")
+HELPER = "/usr/local/libexec/zweitbildschirm-firewall"
+EXT_SCHEMAS = os.path.expanduser("~/.local/share/gnome-shell/extensions/zweitbildschirm@fossil4493.github.io/schemas")
+STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "zweitbildschirm")
+STATE = os.path.join(STATE_DIR, "state")
+GSCHEMA = "org.gnome.desktop.remote-desktop.rdp"
+VENTO = "net.pgaskin.remotedesktop.debug"
+VENTO_HOME = VENTO + "/net.pgaskin.remotedesktop.HomeActivity"
+VENTO_SESSION = VENTO + "/net.pgaskin.remotedesktop.SessionActivity"
+MS_APP = "com.microsoft.rdc.androidx/com.microsoft.rdc.ui.activities.HomeActivity"
+WLAN_ID = "zweitbildschirm-wlan"
+USB_ADDR = "127.0.0.1:3389"
+
+_cfg = [None]
+
+
+def CFG():
+    if _cfg[0] is None:
+        src = Gio.SettingsSchemaSource.new_from_directory(EXT_SCHEMAS, Gio.SettingsSchemaSource.get_default(), False)
+        _cfg[0] = Gio.Settings.new_full(src.lookup("org.gnome.shell.extensions.zweitbildschirm", False), None, None)
+    return _cfg[0]
+
+
+def run(*cmd, timeout=10):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return subprocess.CompletedProcess(cmd, 1, "", str(e))
+
+
+def adb(*args, serial=None, timeout=10):
+    pre = [ADB] + (["-s", serial] if serial else [])
+    return run(*pre, *args, timeout=timeout)
+
+
+def set_state(s):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(s + "\n")
+    os.replace(tmp, STATE)
+
+
+_last_note = [0]
+
+
+def notify(msg):
+    if not CFG().get_boolean("notifications"):
+        return
+    r = run("gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+            "--object-path", "/org/freedesktop/Notifications", "--method", "org.freedesktop.Notifications.Notify",
+            "Tablet-Bildschirm", str(_last_note[0]), "input-tablet-symbolic", "Tablet-Bildschirm", msg, "[]",
+            "{'desktop-entry': <'zweitbildschirm'>, 'transient': <true>}", "5000")
+    m = re.search(r"uint32 (\d+)", r.stdout or "")
+    if m:
+        _last_note[0] = int(m.group(1))
+
+
+_serial_cache = {}
+SINK = "tablet_lautsprecher"
+WIFI_RETRY_S = 15
+
+
+def is_usb(t):
+    return ":" not in t and "._adb" not in t
+
+
+def tablet_transports(serial):
+    """Alle adb-Verbindungen zum Tablet, USB zuerst."""
+    found = []
+    for line in adb("devices").stdout.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 2 or parts[1] != "device":
+            continue
+        t = parts[0]
+        if t not in _serial_cache:
+            _serial_cache[t] = adb("shell", "getprop", "ro.serialno", serial=t).stdout.strip()
+        if _serial_cache[t] == serial:
+            found.append(t)
+    return sorted(found, key=lambda t: not is_usb(t))
+
+
+def try_wireless():
+    out = adb("mdns", "services", timeout=5).stdout
+    for line in out.splitlines():
+        if "_adb-tls-connect" in line:
+            adb("connect", line.split()[-1], timeout=5)
+
+
+def rdp_connected():
+    """Läuft gerade eine RDP-Verbindung (über den Tunnel kommt sie von localhost)?"""
+    out = run("ss", "-Htn", "state", "established", "( sport = :3389 )").stdout
+    return bool(out.strip())
+
+
+def sink_load():
+    if SINK in run("pactl", "list", "short", "sinks").stdout:
+        return
+    run("pactl", "load-module", "module-null-sink", f"sink_name={SINK}",
+        "sink_properties=device.description=Tablet")
+
+
+def sink_unload():
+    for line in run("pactl", "list", "short", "modules").stdout.splitlines():
+        if "module-null-sink" in line and f"sink_name={SINK}" in line:
+            run("pactl", "unload-module", line.split()[0])
+
+
+def audio_only_tablet():
+    """GNOME Remote Desktop greift JEDES Ausgabegerät ab und schickt den Ton ans Tablet.
+    Damit nur das Gerät "Tablet" dort landet, alle seine Tonstreams auf dessen
+    Monitor umhängen (statt trennen: so bekommt GRD weiter Stille und gibt die
+    Sperre auf den gerade spielenden Stream wieder frei)."""
+    try:
+        d = json.loads(run("pw-dump", timeout=5).stdout or "[]")
+    except ValueError:
+        return
+    props = lambda o: (o.get("info") or {}).get("props") or {}
+    nodes = {o["id"]: props(o) for o in d if o.get("type", "").endswith("Node")}
+    ports = {o["id"]: props(o) for o in d if o.get("type", "").endswith("Port")}
+    links = [o for o in d if o.get("type", "").endswith("Link")]
+    tablet = next((i for i, p in nodes.items() if p.get("node.name") == SINK), None)
+    if tablet is None:
+        return
+    mon = {p.get("audio.channel"): i for i, p in ports.items()
+           if p.get("node.id") == tablet and p.get("port.direction") == "out"}
+    for g, p in nodes.items():
+        if not (p.get("node.name", "").startswith("gnome-remote-desktop")
+                and p.get("media.class") == "Stream/Input/Audio"):
+            continue
+        linked = {l["info"]["input-port-id"]: (l["id"], l["info"]["output-node-id"])
+                  for l in links if l["info"]["input-node-id"] == g}
+        for pid, pp in ports.items():
+            if pp.get("node.id") != g or pp.get("port.direction") != "in":
+                continue
+            cur = linked.get(pid)
+            if cur and cur[1] == tablet:
+                continue
+            if cur:
+                run("pw-cli", "destroy", str(cur[0]))
+            ch = pp.get("audio.channel")
+            if ch in mon:
+                run("pw-link", str(mon[ch]), str(pid))
+
+
+# ---------------------------------------------------------------- Firewall
+
+def firewall(*args):
+    """0 = ok, 3 = Tablet in diesem Netz noch nicht freigegeben, sonst Fehler."""
+    if not os.access(HELPER, os.X_OK):
+        return 1
+    return run("pkexec", HELPER, *args, timeout=20).returncode
+
+
+def laptop_ip_towards(ip):
+    out = run("ip", "-o", "route", "get", ip).stdout.split()
+    return out[out.index("src") + 1] if "src" in out else None
+
+
+def peer_connected(ip):
+    out = run("ss", "-Htn", "state", "established", "( sport = :3389 )").stdout
+    peers = [l.split()[-1] for l in out.splitlines() if l.split()]
+    return any(re.search(rf"(^|[\[:]){re.escape(ip)}\]?:\d+$", p) for p in peers)
+
+
+# ---------------------------------------------------------------- Vento
+
+def tls_fingerprint():
+    m = re.search(r"TLS fingerprint:\s*(\S+)", run("grdctl", "status").stdout)
+    return m.group(1).lower() if m else None
+
+
+def vento_read(t, name):
+    r = adb("exec-out", f"run-as {VENTO} cat shared_prefs/{name}", serial=t)
+    return r.stdout if r.returncode == 0 else ""
+
+
+def vento_write(t, name, text):
+    p = subprocess.run([ADB, "-s", t, "exec-in", f"run-as {VENTO} sh -c 'cat > shared_prefs/{name}'"],
+                       input=text, text=True, capture_output=True, timeout=15)
+    return p.returncode == 0
+
+
+def vento_connections(t):
+    m = re.search(r'name="list">(.*?)</string>', vento_read(t, "connections.xml"), re.S)
+    if not m:
+        return None
+    import html
+    try:
+        return json.loads(html.unescape(m.group(1)))
+    except ValueError:
+        return None
+
+
+def vento_prepare_wlan(t, laptop_ip):
+    """Verbindung „Laptop (WLAN)“ auf die aktuelle Laptop-Adresse setzen (Vento muss dafür zu sein)."""
+    conns = vento_connections(t)
+    if conns is None:
+        return None
+    usb = next((c for c in conns if c.get("address") == USB_ADDR), None)
+    if usb is None:
+        return None
+    addr = f"{laptop_ip}:3389"
+    wl = next((c for c in conns if c.get("id") == WLAN_ID), None)
+    want = dict(usb, id=WLAN_ID, name="Laptop (WLAN)", address=addr)
+    hosts = vento_read(t, "known_hosts.xml")
+    fp = tls_fingerprint()
+    need_host = fp and f'name="{addr}"' not in hosts
+    if wl == want and not need_host:
+        return WLAN_ID
+    adb("shell", "am", "force-stop", VENTO, serial=t)
+    conns = [c for c in conns if c.get("id") != WLAN_ID] + [want]
+    xml = ("<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>\n    <string name=\"list\">"
+           + escape(json.dumps(conns, separators=(",", ":")), {'"': "&quot;"}) + "</string>\n</map>\n")
+    vento_write(t, "connections.xml", xml)
+    if need_host:
+        hosts = hosts or "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>\n</map>\n"
+        hosts = hosts.replace("</map>", f'    <string name="{addr}">{fp}</string>\n</map>')
+        vento_write(t, "known_hosts.xml", hosts)
+    return WLAN_ID
+
+
+def vento_usb_id(t):
+    conns = vento_connections(t) or []
+    return next((c["id"] for c in conns if c.get("address") == USB_ADDR), None)
+
+
+def open_app(t, conn_id=None, restart=False):
+    app = CFG().get_string("tablet-app")
+    if app == "none":
+        return
+    if app == "microsoft":
+        adb("shell", "am", "start", "-n", MS_APP, serial=t)
+        return
+    # Ein altes, getrenntes Sitzungsfenster würde nur wieder nach vorn geholt statt neu zu
+    # verbinden -> Vento neu starten, wenn gerade keine Sitzung läuft (oder ausdrücklich gewünscht)
+    if restart or not rdp_connected():
+        adb("shell", "am", "force-stop", VENTO, serial=t)
+    if conn_id and CFG().get_boolean("auto-connect"):
+        adb("shell", "am", "start", "-n", VENTO_SESSION, "-d", f"connection:{conn_id}",
+            "--es", "connection", conn_id, serial=t)
+    else:
+        adb("shell", "am", "start", "-n", VENTO_HOME, serial=t)
+
+
+# ---------------------------------------------------------------- Sitzung
+
+class Session:
+    def __init__(self):
+        self.mode = None        # "usb" | "wlan"
+        self.transport = None
+        self.tablet_ip = None
+        self.layout = None
+        self.active = False
+        self.lost_since = None
+        self.state = ""
+
+    def up(self):
+        run("gsettings", "set", GSCHEMA, "screen-share-mode", "extend")
+        run("gsettings", "set", GSCHEMA, "enable", "true")
+        run("systemctl", "--user", "start", "gnome-remote-desktop.service")
+        if self.layout is None or self.layout.poll() is not None:
+            self.layout = subprocess.Popen([LAYOUT, "watch"])
+        self.active = True
+
+    def use(self, mode, t):
+        first = self.mode is None
+        old_mode, old_t = self.mode, self.transport
+        if mode == "usb":
+            if old_mode == "wlan":
+                firewall("close")
+            adb("reverse", "tcp:3389", "tcp:3389", serial=t)
+            self.mode, self.transport, self.tablet_ip = mode, t, None
+            set_state("verbunden USB")
+            if not first:
+                notify("Tablet jetzt per Kabel verbunden.")
+            open_app(t, vento_usb_id(t) if CFG().get_string("tablet-app") == "vento" else None,
+                     restart=not first)
+        else:
+            ip = t.split(":")[0]
+            lip = laptop_ip_towards(ip)
+            if old_t:
+                adb("reverse", "--remove", "tcp:3389", serial=old_t, timeout=3)
+            rc = firewall("open", ip) if lip else 1
+            if rc != 0:
+                # 3: Tablet hat in diesem Netz eine unbekannte MAC -> Freigabe per Passwort nötig
+                if rc == 3:
+                    if not self.state.startswith("freigeben"):
+                        notify("Tablet in neuem WLAN: im Schnellmenü „Tablet-Bildschirm“ antippen, um es freizugeben.")
+                    set_state(f"freigeben {ip}")
+                    self.state = f"freigeben {ip}"
+                else:
+                    set_state("WLAN nicht möglich")
+                self.mode, self.transport = None, None
+                return
+            self.mode, self.transport, self.tablet_ip = mode, t, ip
+            set_state("verbunden WLAN")
+            self.state = "verbunden WLAN"
+            if not first:
+                notify("Tablet jetzt über WLAN verbunden.")
+            cid = vento_prepare_wlan(t, lip) if CFG().get_string("tablet-app") == "vento" else None
+            open_app(t, cid, restart=not first)
+
+    def desired(self, ts):
+        cfg = CFG()
+        usb = [t for t in ts if is_usb(t)]
+        wifi = [t for t in ts if not is_usb(t)]
+        if usb:
+            if (self.mode == "wlan" and cfg.get_string("cable-while-wlan") == "keep"
+                    and self.tablet_ip and peer_connected(self.tablet_ip)):
+                return "wlan", self.transport
+            return "usb", usb[0]
+        if wifi and cfg.get_boolean("wlan-enabled") and os.access(HELPER, os.X_OK):
+            return "wlan", wifi[0]
+        return None
+
+    def step(self, ts):
+        d = self.desired(ts)
+        if d:
+            self.lost_since = None
+            if not self.active:
+                self.up()
+            if (self.mode, self.transport) != d:
+                self.use(*d)
+            else:
+                if CFG().get_boolean("tablet-sound"):
+                    sink_load()
+                    audio_only_tablet()
+                else:
+                    sink_unload()
+                if self.mode == "usb":
+                    r = adb("reverse", "--list", serial=self.transport).stdout
+                    if "tcp:3389" not in r:
+                        adb("reverse", "tcp:3389", "tcp:3389", serial=self.transport)
+        elif self.active:
+            if self.lost_since is None:
+                self.lost_since = time.monotonic()
+                set_state("sucht Tablet")
+            elif time.monotonic() - self.lost_since > CFG().get_int("grace-seconds"):
+                self.down()
+
+    def down(self, reason="wartet"):
+        if self.transport and self.mode == "usb":
+            adb("reverse", "--remove", "tcp:3389", serial=self.transport, timeout=3)
+        firewall("close")
+        run("systemctl", "--user", "stop", "gnome-remote-desktop.service")
+        run("gsettings", "set", GSCHEMA, "enable", "false")
+        sink_unload()
+        if self.layout and self.layout.poll() is None:
+            self.layout.terminate()
+            try:
+                self.layout.wait(3)
+            except subprocess.TimeoutExpired:
+                self.layout.kill()
+        self.layout = None
+        self.active = False
+        self.mode = self.transport = self.tablet_ip = None
+        self.lost_since = None
+        set_state(reason)
+
+
+def main():
+    sess = Session()
+
+    def bye(*_):
+        sess.down("aus")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGINT, bye)
+
+    sess.down("wartet")
+    adb("start-server", timeout=15)
+    last_wifi = 0.0
+    while True:
+        cfg = CFG()
+        ts = tablet_transports(cfg.get_string("tablet-serial"))
+        sess.step(ts)
+        # WLAN-Steuerverbindung bereithalten, damit der Wechsel ohne Kabel sofort klappt
+        if (cfg.get_boolean("wlan-enabled") and not any(not is_usb(t) for t in ts)
+                and time.monotonic() - last_wifi > WIFI_RETRY_S):
+            last_wifi = time.monotonic()
+            try_wireless()
+        time.sleep(2)
+
+
+if __name__ == "__main__":
+    main()

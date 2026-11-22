@@ -1,0 +1,12 @@
+[Unit]
+Description=Tablet als Zweitbildschirm (startet RDP nur, wenn das Tablet per adb verbunden ist)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/zweitbildschirm-auto
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

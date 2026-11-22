@@ -1,0 +1,16 @@
+{
+  "uuid": "zweitbildschirm@fossil4493.github.io",
+  "name": "Tablet-Zweitbildschirm",
+  "description": "Ein Tablet (oder anderes Gerät mit RDP-App) als erweiterter Bildschirm: GNOME Remote Desktop im Modus „Bildschirm erweitern“, Anordnung merken, Fenster zurückholen, Tonausgabe „Tablet“. Optional: Android-Automatik über adb und Firewall-Helfer.",
+  "shell-version": [
+    "49",
+    "50",
+    "51"
+  ],
+  "version": 3,
+  "settings-schema": "org.gnome.shell.extensions.zweitbildschirm",
+  "session-modes": [
+    "user",
+    "unlock-dialog"
+  ]
+}
