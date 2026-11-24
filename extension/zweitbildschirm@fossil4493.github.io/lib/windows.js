@@ -114,7 +114,10 @@ export class TabletWindows {
             this._fallbackId = 0;
         }
         // einen Moment warten, bis GNOME die neuen Monitorgrenzen übernommen hat
-        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 150, () => {
+        if (this._settleId)
+            GLib.source_remove(this._settleId);
+        this._settleId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 150, () => {
+            this._settleId = 0;
             if (this._settings.get_boolean('restore-windows')) {
                 const states = new Map(this._before ?? []);
                 if (this._tabletIndex() >= 0 && this._tabletPending) {
@@ -127,7 +130,8 @@ export class TabletWindows {
             this._before = null;
             this._busy = false;
             this._takeSnapshot();
-            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 120, () => {
+            this._endId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 120, () => {
+                this._endId = 0;
                 this._transition.end();
                 return GLib.SOURCE_REMOVE;
             });
@@ -169,8 +173,10 @@ export class TabletWindows {
         Main.layoutManager.disconnect(this._monitorsId);
         if (this._timer)
             GLib.source_remove(this._timer);
-        if (this._fallbackId)
-            GLib.source_remove(this._fallbackId);
+        for (const id of [this._fallbackId, this._settleId, this._endId]) {
+            if (id)
+                GLib.source_remove(id);
+        }
         this._snapshot.clear();
         this._tabletPending = null;
     }

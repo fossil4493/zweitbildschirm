@@ -9,7 +9,7 @@ import {run, findProgram} from './util.js';
 const SINK = 'tablet_lautsprecher';
 
 export function available() {
-    return !!(findProgram('pactl') && findProgram('pw-dump') && findProgram('pw-link'));
+    return !!(findProgram('pactl') && findProgram('pw-dump') && findProgram('pw-link') && findProgram('pw-cli'));
 }
 
 /** Gerät „Tablet“ anlegen; war es beim letzten Entfernen die Standardausgabe, wieder dazu machen. */

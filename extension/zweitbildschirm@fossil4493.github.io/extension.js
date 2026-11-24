@@ -1,4 +1,4 @@
-// Tablet-Zweitbildschirm: ein Tablet (oder anderes Gerät mit RDP-App) als erweiterter Bildschirm.
+// Zweitbildschirm: ein Tablet (oder anderes Gerät mit RDP-App) als erweiterter Bildschirm.
 //
 // Grundfunktion (ohne root, ohne Entwickleroptionen): GNOME Remote Desktop im Modus
 // „Bildschirm erweitern“, Anordnung merken, Fenster zurückholen, Tonausgabe „Tablet“.
@@ -39,6 +39,11 @@ class Controller {
         this._lastWifi = 0;
         this._tick = 0;
         this._busy = false;
+        this._stepDone = Promise.resolve();
+        this._destroyed = false;
+        this._firewallFailed = 0;
+        this._netSig = null;
+        this._allowed = null;
         this._noted = new Set();
         this.status = {text: 'Aus', peers: [], addresses: [], approveIp: null};
         // GNOME beendet Bildschirmfreigaben beim Sperren; nach dem Entsperren neu verbinden
@@ -55,6 +60,9 @@ class Controller {
             }
             this._wasLocked = locked;
         });
+        this._reloadId = firewall.onReload(() => {
+            this._firewallOpen = false;
+        });
         this._timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, TICK_MS, () => {
             this._step();
             return GLib.SOURCE_CONTINUE;
@@ -67,14 +75,31 @@ class Controller {
         this._onChange();
     }
 
-    /** Tablet-Bildschirm über adb aus- oder einschalten (nur mit Android-Automatik). */
+    /** Bildschirm des Tablets über adb aus- oder einschalten (nur mit Android-Automatik). Aus nur, wenn das
+     *  Tablet gerade als Bildschirm läuft; an nur, wenn es so ausgeschaltet wurde. */
     _tabletScreen(action) {
         if (!this._settings.get_boolean('active') || !this._settings.get_boolean('adb-enabled') || !this._adb.path())
             return;
         (async () => {
-            const t = this._transport ?? (await this._adb.transports())[0];
+            if (action === 'sleep') {
+                if (!this._transport || !this.status.peers.length)
+                    return;
+                this._sleptSerial = this._adb.serialOf(this._transport);
+                await this._adb.sleep(this._transport);
+                return;
+            }
+            const serial = this._sleptSerial;
+            this._sleptSerial = null;
+            if (!serial)
+                return;
+            let t = await this._adb.transportOf(serial);
+            if (!t) {
+                // adb über WLAN kann im Schlaf des Tablets abreißen
+                await this._adb.connectWireless();
+                t = await this._adb.transportOf(serial);
+            }
             if (t)
-                await this._adb[action](t);
+                await this._adb.wake(t);
         })().catch(e => logError(e, 'Zweitbildschirm'));
     }
 
@@ -87,10 +112,10 @@ class Controller {
     }
 
     _step() {
-        if (this._busy)
+        if (this._busy || this._destroyed)
             return;
         this._busy = true;
-        this._stepAsync().catch(e => logError(e, 'Zweitbildschirm')).finally(() => {
+        this._stepDone = this._stepAsync().catch(e => logError(e, 'Zweitbildschirm')).finally(() => {
             this._busy = false;
         });
     }
@@ -113,11 +138,29 @@ class Controller {
         else
             await this._stepBasic();
 
+        if (this._running && this._mode !== 'usb')
+            await this._syncFirewall();
         if (this._running) {
             const peers = await rdp.peers();
             this._set({peers});
             await this._sound(peers.length > 0);
         }
+    }
+
+    async _syncFirewall() {
+        if (!this._settings.get_boolean('firewall-auto') || !firewall.installed())
+            return;
+        const sig = await firewall.networkSignature();
+        if (this._netSig === null) {
+            this._netSig = sig;
+        } else if (sig !== this._netSig) {
+            this._netSig = sig;
+            this._allowed = null;
+            this._firewallOpen = false;
+            this._firewallFailed = 0;
+        }
+        if (!this._firewallOpen)
+            await this._openFirewall();
     }
 
     /**
@@ -161,7 +204,7 @@ class Controller {
         const st = await rdp.status();
         if (!st.user || !st.hasPassword) {
             this._set({text: 'Benutzer und Passwort fehlen'});
-            this._notifyOnce('creds', 'Tablet-Bildschirm', 'Bitte zuerst Benutzer und Passwort in den Einstellungen festlegen.');
+            this._notifyOnce('creds', 'Zweitbildschirm', 'Bitte zuerst Benutzer und Passwort in den Einstellungen festlegen.');
             return false;
         }
         if (!await rdp.ensureCertificate()) {
@@ -174,16 +217,26 @@ class Controller {
     }
 
     async _openFirewall() {
-        if (this._settings.get_boolean('firewall-auto') && firewall.installed()) {
-            this._firewallOpen = (await firewall.open()).ok;
-            return this._firewallOpen;
+        if (!this._settings.get_boolean('firewall-auto') || !firewall.installed())
+            return false;
+        if (Date.now() - this._firewallFailed < 60000)
+            return false;
+        this._firewallTouched = true;
+        const r = await firewall.open();
+        this._firewallOpen = r.ok;
+        this._firewallFailed = r.ok ? 0 : Date.now();
+        if (!r.ok) {
+            this._notifyOnce('firewall', 'Firewall-Helfer', r.status === 6
+                ? 'firewalld läuft nicht. Der Helfer arbeitet nur mit firewalld.'
+                : `Port konnte nicht geöffnet werden: ${(r.err || r.out).trim()}`);
         }
-        return false;
+        return this._firewallOpen;
     }
 
     async _closeFirewall() {
-        if (this._firewallOpen) {
+        if (this._firewallTouched) {
             await firewall.close();
+            this._firewallTouched = false;
             this._firewallOpen = false;
         }
     }
@@ -194,13 +247,8 @@ class Controller {
         this._reconnect = false;   // ohne adb kann nur die App am Tablet neu verbinden
         if (this._mode)
             await this._leaveAdb();
-        if (this._running && !this._firewallOpen)
-            await this._openFirewall();   // z. B. nach Kabelbetrieb (Tunnel braucht keinen offenen Port)
-        if (!this._running) {
-            if (!await this._startServer())
-                return;
-            await this._openFirewall();
-        }
+        if (!this._running && !await this._startServer())
+            return;
         if (this._tick % 10 === 1)
             this._set({addresses: await localAddresses()});
         const p = this.status.peers;
@@ -268,20 +316,24 @@ class Controller {
             this._transport = t;
             this._set({text: 'Verbunden per Kabel', approveIp: null});
             if (switching)
-                this._ext.notify('Tablet-Bildschirm', 'Tablet jetzt per Kabel verbunden.', true);
+                this._ext.notify('Zweitbildschirm', 'Tablet jetzt per Kabel verbunden.', true);
             if (peers.length && peers.every(p => p === '127.0.0.1'))
                 return;   // läuft schon über den Tunnel
-            await this._checkVento(t);
-            await this._adb.openApp(t, await this._adb.usbConnectionId(t), {fresh});
+            await this._adb.openApp(t, await this._usbConnection(t), {fresh});
             return;
         }
         // WLAN: direkte Verbindung, Firewall nur für das freigegebene Tablet
-        const ip = t.split(':')[0];
+        const ip = await this._adb.ipOf(t);
+        if (!ip) {
+            this._set({text: 'WLAN: Adresse des Tablets unbekannt'});
+            return;
+        }
         const mac = await firewall.macOf(ip);
-        if (!mac || !(await firewall.allowedMacs()).includes(mac)) {
+        this._allowed ??= await firewall.allowedMacs();
+        if (!mac || !this._allowed.includes(mac)) {
             this._set({text: 'WLAN: Tablet freigeben', approveIp: ip});
             this._notifyOnce(`approve-${mac}`, 'Tablet in neuem WLAN',
-                'Im Schnellmenü „Tablet-Bildschirm“ → „Tablet freigeben“ antippen (Admin-Passwort).');
+                'Im Schnellmenü „Zweitbildschirm“ → „Tablet freigeben“ antippen (Admin-Passwort).');
             return;
         }
         if (this._mode === 'usb')
@@ -296,7 +348,7 @@ class Controller {
         this._transport = t;
         this._set({text: 'Verbunden über WLAN', approveIp: null});
         if (switching)
-            this._ext.notify('Tablet-Bildschirm', 'Tablet jetzt über WLAN verbunden.', true);
+            this._ext.notify('Zweitbildschirm', 'Tablet jetzt über WLAN verbunden.', true);
         // läuft schon eine direkte Sitzung von diesem Tablet (selbst verbunden), nicht stören
         if (peers.includes(ip))
             return;
@@ -305,21 +357,22 @@ class Controller {
         await this._adb.openApp(t, cid, {fresh: true});
     }
 
-    /** Hinweis, wenn Ventos Kabel-Verbindung so eingestellt ist, dass die Anmeldung scheitert
-     *  (Vento fragt dann nur immer wieder nach dem Passwort). */
-    async _checkVento(t) {
-        const problem = await this._adb.usbConnectionProblem(t, (await rdp.status()).user);
+    /** ID von Ventos Kabel-Verbindung; meldet einmal, wenn sie so eingestellt ist, dass die Anmeldung
+     *  scheitert (Vento fragt dann nur immer wieder nach dem Passwort). */
+    async _usbConnection(t) {
+        const {id, problem} = await this._adb.usbConnection(t, (await rdp.status()).user);
         if (problem)
             this._notifyOnce(`vento-${problem}`, 'Vento falsch eingerichtet', problem);
+        return id;
     }
 
     async _reopen(mode, t) {
         let cid;
         if (mode === 'usb') {
-            await this._checkVento(t);
-            cid = await this._adb.usbConnectionId(t);
+            cid = await this._usbConnection(t);
         } else {
-            const route = await run(['ip', '-o', 'route', 'get', t.split(':')[0]]);
+            const ip = await this._adb.ipOf(t);
+            const route = ip ? await run(['ip', '-o', 'route', 'get', ip]) : {out: ''};
             const laptopIp = route.out.match(/\bsrc\s+([\d.]+)/)?.[1];
             cid = laptopIp ? await this._adb.prepareWlan(t, laptopIp, (await rdp.status()).fingerprint) : null;
         }
@@ -335,8 +388,10 @@ class Controller {
 
     async approve(ip) {
         const r = await firewall.approve(ip);
-        if (r.ok)
+        if (r.ok) {
             this._noted.clear();
+            this._allowed = null;
+        }
         this._step();
         return r;
     }
@@ -356,11 +411,13 @@ class Controller {
     }
 
     destroy() {
+        this._destroyed = true;
         Main.sessionMode.disconnect(this._modeId);
+        firewall.offReload(this._reloadId);
         if (this._timer)
             GLib.source_remove(this._timer);
         this._timer = 0;
-        this.shutdown().catch(e => logError(e));
+        this._stepDone.then(() => this.shutdown()).catch(e => logError(e));
     }
 }
 
@@ -369,10 +426,10 @@ class Controller {
 const TabletToggle = GObject.registerClass(
 class TabletToggle extends QuickMenuToggle {
     _init(ext, settings) {
-        super._init({title: 'Tablet-Bildschirm', iconName: ICON, toggleMode: false});
+        super._init({title: 'Zweitbildschirm', iconName: ICON, toggleMode: false});
         this._ext = ext;
         this._settings = settings;
-        this.menu.setHeader(ICON, 'Tablet-Bildschirm', '');
+        this.menu.setHeader(ICON, 'Zweitbildschirm', '');
         this._info = new PopupMenu.PopupMenuSection();
         this.menu.addMenuItem(this._info);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
@@ -386,14 +443,18 @@ class TabletToggle extends QuickMenuToggle {
         const st = ctl?.status ?? {text: 'Aus', peers: [], addresses: []};
         this.checked = this._settings.get_boolean('active');
         this.subtitle = st.text;
-        this.menu.setHeader(ICON, 'Tablet-Bildschirm', st.text);
+        this.menu.setHeader(ICON, 'Zweitbildschirm', st.text);
         this._info.removeAll();
         if (this.checked && !this._settings.get_boolean('adb-enabled')) {
             for (const a of st.addresses ?? [])
                 this._info.addMenuItem(new PopupMenu.PopupMenuItem(`Adresse: ${a.ip}:${rdp.PORT}  (${a.dev})`, {reactive: false}));
         }
         if (st.approveIp) {
-            this._info.addAction(`Tablet freigeben (${st.approveIp}) …`, () => ctl.approve(st.approveIp));
+            this._info.addAction(`Tablet freigeben (${st.approveIp}) …`, async () => {
+                const r = await ctl.approve(st.approveIp);
+                if (!r.ok && r.status !== 126)
+                    this._ext.notify('Tablet nicht freigegeben', (r.err || r.out).trim() || `Fehler ${r.status}`);
+            });
         }
     }
 
@@ -411,6 +472,9 @@ class Indicator extends SystemIndicator {
         this._icon.iconName = ICON;
         this._icon.visible = false;
         this.toggle = new TabletToggle(ext, settings);
+        this.toggle.connect('destroy', () => {
+            this.toggle = null;
+        });
         this.quickSettingsItems.push(this.toggle);
         // auf dem Sperrbildschirm nichts anbieten (die Verbindung selbst läuft weiter)
         this._modeId = Main.sessionMode.connect('updated', () => this._syncLocked());
@@ -418,10 +482,13 @@ class Indicator extends SystemIndicator {
     }
 
     _syncLocked() {
-        this.toggle.visible = !Main.sessionMode.isLocked;
+        if (this.toggle)
+            this.toggle.visible = !Main.sessionMode.isLocked;
     }
 
     update(peers) {
+        if (!this.toggle)
+            return;
         this._icon.visible = peers.length > 0;
         this.toggle.update();
     }
@@ -437,6 +504,9 @@ export default class ZweitbildschirmExtension extends Extension {
     enable() {
         this._settings = this.getSettings();
         this._indicator = new Indicator(this, this._settings);
+        this._indicator.connect('destroy', () => {
+            this._indicator = null;
+        });
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
         this.controller = new Controller(this, this._settings, () => this._indicator?.update(this.controller?.status.peers ?? []));
         this._transition = new Transition(this._settings);
@@ -461,7 +531,7 @@ export default class ZweitbildschirmExtension extends Extension {
         if (!this._settings?.get_boolean('notifications'))
             return;
         if (!this._source) {
-            this._source = new MessageTray.Source({title: 'Tablet-Bildschirm', iconName: ICON});
+            this._source = new MessageTray.Source({title: 'Zweitbildschirm', iconName: ICON});
             this._source.connect('destroy', () => {
                 this._source = null;
             });

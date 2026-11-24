@@ -76,13 +76,15 @@ export class LayoutKeeper {
         this._seen = null;
         this._pending = 0;
         this._proxy = null;
+        this._cancel = new Gio.Cancellable();
         Gio.DBusProxy.new_for_bus(Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, null,
             'org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig',
-            'org.gnome.Mutter.DisplayConfig', null, (_o, res) => {
+            'org.gnome.Mutter.DisplayConfig', this._cancel, (_o, res) => {
                 try {
                     this._proxy = Gio.DBusProxy.new_for_bus_finish(res);
                 } catch (e) {
-                    logError(e, 'Zweitbildschirm: DisplayConfig');
+                    if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                        logError(e, 'Zweitbildschirm: DisplayConfig');
                     return;
                 }
                 this._signalId = this._proxy.connect('g-signal', (_p, _s, name) => {
@@ -152,6 +154,10 @@ export class LayoutKeeper {
                 const [tw, th] = this._size(st, st.virt, vs);
                 const rects = out.map(o => [o[1], o[2], ...this._size(st, o[0], o[3])]);
                 const prim = out.find(o => o[4]);
+                if (!prim) {
+                    out.push([st.virt, 0, 0, vs, true]);
+                    return out;
+                }
                 const [, ph] = this._size(st, prim[0], prim[3]);
                 let cand = [prim[1] - tw, prim[2] + ph - th, tw, th];
                 if (rects.some(r => overlaps(cand, r))) {
@@ -165,7 +171,7 @@ export class LayoutKeeper {
     }
 
     async apply() {
-        if (!this._proxy || !this._settings.get_boolean('remember-layout'))
+        if (!this._proxy || this._cancel.is_cancelled() || !this._settings.get_boolean('remember-layout'))
             return;
         const st = await this._state();
         if (!st.virt)
@@ -196,7 +202,7 @@ export class LayoutKeeper {
     }
 
     async _changed() {
-        if (!this._settings.get_boolean('remember-layout'))
+        if (!this._proxy || !this._settings.get_boolean('remember-layout'))
             return;
         const st = await this._state();
         const now = st.virt ? `${st.virt[5][0][3]}/${st.key}` : null;
@@ -215,6 +221,7 @@ export class LayoutKeeper {
     }
 
     destroy() {
+        this._cancel.cancel();
         if (this._pending)
             GLib.source_remove(this._pending);
         if (this._proxy && this._signalId)

@@ -12,9 +12,19 @@ import {findProgram, localAddresses} from './lib/util.js';
 
 function randomPassword() {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+    const limit = 256 - 256 % chars.length;
+    const stream = Gio.File.new_for_path('/dev/urandom').read(null);
     let s = '';
-    for (let i = 0; i < 16; i++)
-        s += chars[GLib.random_int_range(0, chars.length)];
+    try {
+        while (s.length < 16) {
+            for (const b of stream.read_bytes(64, null).toArray()) {
+                if (b < limit && s.length < 16)
+                    s += chars[b % chars.length];
+            }
+        }
+    } finally {
+        stream.close(null);
+    }
     return s;
 }
 
@@ -53,7 +63,7 @@ export default class ZweitbildschirmPrefs extends ExtensionPreferences {
         const start = new Adw.PreferencesGroup({
             title: 'So geht’s',
             description: '1. Benutzer und Passwort festlegen.\n' +
-                '2. In den Schnelleinstellungen „Tablet-Bildschirm“ einschalten.\n' +
+                '2. In den Schnelleinstellungen „Zweitbildschirm“ einschalten.\n' +
                 '3. Am Tablet in einer RDP-App (z. B. Vento oder Microsoft Remote Desktop) eine Verbindung zu einer der Adressen unten anlegen.\n' +
                 'Per Kabel ohne Entwickleroptionen: am Tablet „USB-Tethering“ einschalten und die Adresse der USB-Verbindung nehmen.',
         });
@@ -138,9 +148,9 @@ export default class ZweitbildschirmPrefs extends ExtensionPreferences {
         window.add(fwPage);
         const fwInfo = new Adw.PreferencesGroup({
             title: 'Netzwerkzugang',
-            description: 'Das Tablet verbindet sich auf Port 3389 mit diesem Rechner. Ist eine Firewall aktiv (z. B. firewalld bei openSUSE und Fedora), muss sie das durchlassen.\n\n' +
+            description: 'Das Tablet verbindet sich auf Port 3389 mit diesem Rechner. GNOME Remote Desktop nimmt Verbindungen auf allen Netzwerken an, solange der Zweitbildschirm an ist. Ohne aktive Firewall kann sich also jeder im selben Netz an der Anmeldung versuchen. Ist eine Firewall aktiv (z. B. firewalld bei openSUSE und Fedora), muss sie das Tablet durchlassen.\n\n' +
                 'Ohne Helfer, nur bis zum Neustart der Firewall:\n    sudo firewall-cmd --add-port=3389/tcp\n\n' +
-                'Mit Helfer (empfohlen): Port nur für freigegebene Geräte und nur, solange der Tablet-Bildschirm an ist. Installation aus dem Quellordner: sudo make install',
+                'Mit Helfer (empfohlen): Port nur für freigegebene Geräte und nur, solange der Zweitbildschirm an ist. Installation aus dem Quellordner: sudo make install',
         });
         fwPage.add(fwInfo);
         const fwGroup = new Adw.PreferencesGroup({title: 'Firewall-Helfer'});
@@ -150,6 +160,12 @@ export default class ZweitbildschirmPrefs extends ExtensionPreferences {
             subtitle: firewall.installed() ? 'installiert' : 'nicht installiert (sudo make install)',
         });
         fwGroup.add(helperRow);
+        if (firewall.installed()) {
+            firewall.firewalldRunning().then(ok => {
+                if (!ok)
+                    helperRow.subtitle = 'installiert, aber firewalld läuft nicht. Der Helfer arbeitet nur mit firewalld.';
+            });
+        }
         const auto = switchRow(settings, 'firewall-auto', 'Port automatisch öffnen',
             'Nur für freigegebene Geräte (MAC-Adresse), nur in dem Netz, in dem sie freigegeben wurden, nur zur Laufzeit.');
         auto.sensitive = firewall.installed();
@@ -171,7 +187,7 @@ export default class ZweitbildschirmPrefs extends ExtensionPreferences {
         approveBtn.sensitive = firewall.installed();
         approveBtn.connect('clicked', async () => {
             const r = await firewall.approve(ip.text.trim());
-            toast(r.ok ? 'Freigegeben' : `Nicht freigegeben: ${(r.err || r.out).trim()}`);
+            toast(r.ok ? 'Freigegeben. Der Port öffnet sich, sobald der Zweitbildschirm an ist.' : `Nicht freigegeben: ${(r.err || r.out).trim()}`);
             refreshMacs();
         });
         ip.add_suffix(approveBtn);
@@ -214,9 +230,9 @@ export default class ZweitbildschirmPrefs extends ExtensionPreferences {
         aGroup.add(switchRow(settings, 'wlan-enabled', 'WLAN nutzen, wenn kein Kabel steckt',
             'Braucht kabelloses Debugging und den Firewall-Helfer'));
         aGroup.add(switchRow(settings, 'lock-tablet', 'Tablet mitsperren',
-            'Sperrt der Laptop, geht der Bildschirm des Tablets aus und das Tablet ist gesperrt. Nur per Kabel oder kabellosem Debugging'));
+            'Sperrt der Laptop, während das Tablet als Bildschirm läuft, geht der Bildschirm des Tablets aus und das Tablet ist gesperrt. Nur per Kabel oder kabellosem Debugging'));
         aGroup.add(switchRow(settings, 'wake-tablet', 'Tablet beim Entsperren aufwecken',
-            'Entsperrt der Laptop, geht der Bildschirm des Tablets an; entsperrt wird am Tablet (Fingerabdruck, Gesicht, PIN)'));
+            'Entsperrt der Laptop, geht der Bildschirm des Tablets wieder an, wenn er mitgesperrt wurde; entsperrt wird am Tablet (Fingerabdruck, Gesicht, PIN)'));
         aGroup.add(comboRow(settings, 'cable-while-wlan', 'Kabel angesteckt während einer WLAN-Sitzung', null, [
             ['switch', 'Auf Kabel wechseln (kurze Unterbrechung)'], ['keep', 'WLAN-Sitzung behalten'],
         ]));

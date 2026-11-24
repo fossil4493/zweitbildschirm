@@ -1,4 +1,4 @@
-# Tablet-Zweitbildschirm
+# Zweitbildschirm
 #
 #   make                    Erweiterung als ZIP bauen (build/)
 #   make install-extension  Erweiterung für den aktuellen Benutzer installieren (ohne root)
@@ -38,6 +38,9 @@ uninstall-extension:
 	gnome-extensions uninstall $(UUID)
 
 install:
+	@case "$(LIBEXECDIR)" in /usr/local/libexec|/usr/libexec|/usr/lib/zweitbildschirm) ;; \
+	  *) echo "LIBEXECDIR muss /usr/local/libexec, /usr/libexec oder /usr/lib/zweitbildschirm sein (dort sucht die Erweiterung)."; exit 1;; esac
+	@command -v firewall-cmd >/dev/null || echo "Hinweis: firewalld fehlt. Der Helfer arbeitet nur mit firewalld."
 	install -d $(DESTDIR)$(LIBEXECDIR) $(DESTDIR)$(POLKITDIR)
 	install -m 0755 system/zweitbildschirm-firewall $(DESTDIR)$(LIBEXECDIR)/zweitbildschirm-firewall
 	install -m 0755 system/zweitbildschirm-freigabe $(DESTDIR)$(LIBEXECDIR)/zweitbildschirm-freigabe

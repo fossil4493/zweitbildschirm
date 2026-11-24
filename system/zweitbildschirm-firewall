@@ -1,5 +1,5 @@
 #!/bin/bash
-# Firewall-Helfer für den Tablet-Zweitbildschirm (läuft als root über pkexec).
+# Firewall-Helfer für den Zweitbildschirm (läuft als root über pkexec).
 #
 # Öffnet Port 3389 (RDP) nur für freigegebene Geräte, erkannt an ihrer MAC-Adresse, nur in dem
 # Netz, in dem sie freigegeben wurden (erkannt an der MAC-Adresse des Routers), und nur zur
@@ -11,12 +11,14 @@
 #   zweitbildschirm-firewall status   gesetzte Regeln zeigen
 #   zweitbildschirm-firewall macs     im aktuellen Netz freigegebene MACs zeigen
 #   zweitbildschirm-firewall netz     Kennung der aktuellen Netze (MAC des Routers)
+#   zweitbildschirm-firewall pruefen  nur prüfen, ob firewalld läuft
 #
 # Neue Geräte gibt nur zweitbildschirm-freigabe frei (eigene polkit-Aktion, Admin-Passwort).
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 PORT=3389
 ALLOW=/etc/zweitbildschirm/erlaubte-macs
+OFFEN=/run/zweitbildschirm/offen
 MARK="port port=\"$PORT\" protocol=\"tcp\" accept"
 
 command -v firewall-cmd >/dev/null || { echo "firewalld fehlt" >&2; exit 6; }
@@ -26,27 +28,38 @@ zones() {  # aktive Zonen mit Schnittstellen, ohne trusted und docker
   firewall-cmd --get-active-zones | awk '!/^ /{print $1}' | grep -vxE 'trusted|docker' || true
 }
 
-rules() {  # Zone<TAB>Regel
-  for z in $(zones); do
+all_zones() {
+  firewall-cmd --get-zones | tr ' ' '\n' | grep -vxE 'trusted|docker|' || true
+}
+
+rules() {  # Zone<TAB>Regel, auch in Zonen, die inzwischen nicht mehr aktiv sind
+  for z in $(all_zones); do
     firewall-cmd --zone="$z" --list-rich-rules | grep -F "$MARK" | grep -F 'source mac=' | sed "s/^/$z\t/" || true
   done
 }
 
 close() {
   rules | while IFS=$'\t' read -r z r; do firewall-cmd -q --zone="$z" --remove-rich-rule="$r"; done
+  rm -f "$OFFEN"
 }
 
 MACRE='([0-9a-f]{2}:){5}[0-9a-f]{2}'
 
+lladdr() {  # MAC-Adresse einer IP an einer Schnittstelle, höchstens eine
+  ip neigh show "$1" dev "$2" | awk '{for(i=1;i<NF;i++) if($i=="lladdr") {print tolower($(i+1)); exit}}'
+}
+
 network_of_dev() {  # Netz-Kennung einer Schnittstelle: MAC des Routers (sonst Schnittstelle+Subnetz)
-  local dev=$1 gw mac
+  local dev=$1 gw mac try
   gw=$(ip -4 route show default dev "$dev" | awk '{print $3; exit}')
   if [ -n "$gw" ]; then
-    ping -c1 -W1 "$gw" >/dev/null 2>&1 || true
-    mac=$(ip neigh show "$gw" dev "$dev" | awk '{for(i=1;i<NF;i++) if($i=="lladdr") print tolower($(i+1))}')
-    [ -n "$mac" ] && { echo "gw-$mac"; return; }
+    for try in 1 2 3; do
+      mac=$(lladdr "$gw" "$dev")
+      [ -n "$mac" ] && { echo "gw-$mac"; return; }
+      ping -c1 -W1 "$gw" >/dev/null 2>&1 || true
+    done
   fi
-  echo "net-$dev-$(ip -4 -o addr show dev "$dev" | awk '{print $4; exit}')"
+  echo "net-$dev-$(ip -4 route show dev "$dev" scope link proto kernel | awk '{print $1; exit}')"
 }
 
 current_networks() {
@@ -62,6 +75,14 @@ macs() {  # Geräte, die im aktuellen Netz freigegeben sind
   done < "$ALLOW" | sort -u
 }
 
+valid_ip() {  # private IPv4-Adresse, ohne Loopback und link-local
+  local a b c d
+  [[ "$1" =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$ ]] || return 1
+  a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]})) c=$((10#${BASH_REMATCH[3]})) d=$((10#${BASH_REMATCH[4]}))
+  (( a <= 255 && b <= 255 && c <= 255 && d <= 255 )) || return 1
+  (( a == 10 )) || (( a == 172 && b >= 16 && b <= 31 )) || (( a == 192 && b == 168 ))
+}
+
 case "${1:-}" in
   open)
     close
@@ -70,9 +91,15 @@ case "${1:-}" in
         firewall-cmd -q --zone="$z" --add-rich-rule="rule source mac=\"$m\" $MARK"
       done
     done
+    install -d -m 0755 "$(dirname "$OFFEN")"
+    touch "$OFFEN"
     echo "offen für: $(macs | tr '\n' ' ')"
     ;;
+  reopen)  # nach einer neuen Freigabe, aber nur, wenn der Port gerade offen ist
+    if [ -e "$OFFEN" ]; then exec "$0" open; fi
+    ;;
   close) close ;;
+  pruefen) ;;
   status) rules ;;
   macs) macs ;;
   netz) current_networks ;;
@@ -80,17 +107,16 @@ case "${1:-}" in
     # nur über zweitbildschirm-freigabe (setzt ZB_FREIGABE=1; pkexec löscht die Umgebung des Aufrufers)
     [ "${ZB_FREIGABE:-}" = 1 ] || { echo "Freigabe nur über zweitbildschirm-freigabe" >&2; exit 5; }
     ip="${2:-}"
-    /usr/bin/python3 -I -c 'import ipaddress,sys; a=ipaddress.ip_address(sys.argv[1]); sys.exit(0 if a.version==4 and a.is_private and not a.is_loopback and not a.is_link_local else 1)' "$ip" 2>/dev/null \
-      || { echo "ungültige Adresse: $ip" >&2; exit 2; }
+    valid_ip "$ip" || { echo "keine private IPv4-Adresse: $ip" >&2; exit 2; }
     ping -c1 -W1 "$ip" >/dev/null 2>&1 || true
-    mac=$(ip neigh show "$ip" | awk '{for(i=1;i<NF;i++) if($i=="lladdr") print tolower($(i+1))}')
+    dev=$(ip -o route get "$ip" | awk '{for(i=1;i<NF;i++) if($i=="dev") {print $(i+1); exit}}')
+    mac=$(lladdr "$ip" "$dev")
     [ -n "$mac" ] || { echo "Gerät $ip nicht im lokalen Netz gefunden" >&2; exit 4; }
-    dev=$(ip -o route get "$ip" | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}')
     net=$(network_of_dev "$dev")
     install -d -m 0755 "$(dirname "$ALLOW")"
     touch "$ALLOW"; chmod 0644 "$ALLOW"
     grep -qx "$mac $net" "$ALLOW" || echo "$mac $net" >> "$ALLOW"
     echo "freigegeben: $ip ($mac) im Netz $net"
     ;;
-  *) echo "Aufruf: $0 open | close | status | macs | netz" >&2; exit 2 ;;
+  *) echo "Aufruf: $0 open | close | status | macs | netz | pruefen" >&2; exit 2 ;;
 esac

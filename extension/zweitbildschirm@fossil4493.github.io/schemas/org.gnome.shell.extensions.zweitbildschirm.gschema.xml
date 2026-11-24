@@ -3,7 +3,7 @@
   <schema id="org.gnome.shell.extensions.zweitbildschirm" path="/org/gnome/shell/extensions/zweitbildschirm/">
     <key name="active" type="b">
       <default>false</default>
-      <summary>Tablet-Bildschirm eingeschaltet (Schalter in den Schnelleinstellungen)</summary>
+      <summary>Zweitbildschirm eingeschaltet (Schalter in den Schnelleinstellungen)</summary>
     </key>
 
     <!-- Grundfunktion -->

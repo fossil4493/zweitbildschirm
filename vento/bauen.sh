@@ -1,7 +1,7 @@
 #!/bin/bash
 # Baut Vento mit "Direct touch" in einem Podman-Container und legt die APK als
-# vento/vento-touch-pr23.apk ab. Quelle: Git-Repo in $VENTO_REPO mit dem Branch touch-pr23
-# (upstream https://github.com/pgaskin/vento mit Pull-Request #23 und dem Ton-Patch).
+# vento/vento-touch-pr23.apk ab. Quelle: Branch touch-pr23 von https://github.com/fossil4493/vento
+# (upstream https://github.com/pgaskin/vento mit Pull-Request #23 und dem Ton-Patch), änderbar mit $VENTO_REPO.
 # Platzbedarf während des Builds ca. 8 GB unter $VENTO_BUILD (Standard ~/.cache/vento-build),
 # danach kann der Ordner gelöscht werden.
 set -euo pipefail
@@ -11,7 +11,7 @@ mkdir -p "$B"/{sdk,cargo,rustup,gradle}
 # Signierschlüssel dauerhaft aufheben: ein neuer Schlüssel erzwingt Deinstallieren (Verbindungen weg)
 KEY=${VENTO_KEY:-$HOME/.config/vento-signatur}
 mkdir -p "$KEY"
-[ -d "$B/src" ] || git clone -b touch-pr23 "${VENTO_REPO:?VENTO_REPO auf das Vento-Repo mit Branch touch-pr23 setzen}" "$B/src"
+[ -d "$B/src" ] || git clone -b touch-pr23 "${VENTO_REPO:-https://github.com/fossil4493/vento.git}" "$B/src"
 git -C "$B/src" submodule update --init --depth 1 --jobs 8
 # setzt die Submodule auf den Stand ohne Vento-Patches zurück -> build.sh patcht neu
 rm -f "$B/src/.patched"

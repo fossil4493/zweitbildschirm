@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Tablet-Bildschirm
-Comment=Galaxy Tab als zweiter Bildschirm
-Icon=input-tablet-symbolic
-Exec=zweitbildschirm status
-NoDisplay=true
-X-GNOME-UsesNotifications=true

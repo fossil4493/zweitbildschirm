@@ -2,10 +2,10 @@
 <!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
-  <vendor>Tablet-Zweitbildschirm</vendor>
+  <vendor>Zweitbildschirm</vendor>
   <action id="io.github.fossil4493.zweitbildschirm.firewall">
-    <description>Firewall für den Tablet-Zweitbildschirm schalten</description>
-    <message>Der Tablet-Zweitbildschirm möchte Port 3389 für freigegebene Geräte öffnen oder schließen</message>
+    <description>Firewall für den Zweitbildschirm schalten</description>
+    <message>Der Zweitbildschirm möchte Port 3389 für freigegebene Geräte öffnen oder schließen</message>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
@@ -14,8 +14,8 @@
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXECDIR@/zweitbildschirm-firewall</annotate>
   </action>
   <action id="io.github.fossil4493.zweitbildschirm.freigabe">
-    <description>Gerät für den Tablet-Zweitbildschirm freigeben</description>
-    <message>Ein Gerät soll sich als Tablet-Zweitbildschirm verbinden dürfen. Freigeben?</message>
+    <description>Gerät für den Zweitbildschirm freigeben</description>
+    <message>Ein Gerät soll sich als Zweitbildschirm verbinden dürfen. Freigeben?</message>
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>

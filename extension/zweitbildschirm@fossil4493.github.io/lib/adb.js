@@ -11,6 +11,15 @@ const VENTO_PKGS = ['net.pgaskin.remotedesktop', 'net.pgaskin.remotedesktop.debu
 
 export const isUsb = t => !t.includes(':') && !t.includes('._adb');
 
+const unescapeXml = s => s.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&#10;/g, '\n').replace(/&amp;/g, '&');
+const escapeXml = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+function prefsXml(entries) {
+    const lines = [...entries].map(([k, v]) => `    <string name="${escapeXml(k)}">${escapeXml(v)}</string>\n`);
+    return `<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>\n${lines.join('')}</map>\n`;
+}
+
 export class Adb {
     constructor(settings) {
         this._settings = settings;
@@ -30,26 +39,64 @@ export class Adb {
         return run([adb, ...(serial ? ['-s', serial] : []), ...args], opts);
     }
 
-    /** Verbindungen zum Tablet, USB zuerst. */
-    async transports() {
-        const want = this._settings.get_string('tablet-serial').trim();
+    async _online() {
         const r = await this._adb(['devices']);
+        if (!r.ok)
+            return [];
         const found = [];
         for (const line of r.out.split('\n').slice(1)) {
             const [t, state] = line.trim().split(/\s+/);
             if (state !== 'device')
                 continue;
-            if (!this._serials.has(t))
-                this._serials.set(t, (await this._adb(['shell', 'getprop', 'ro.serialno'], t)).out.trim());
-            if (!want || this._serials.get(t) === want)
-                found.push(t);
+            if (!this._serials.get(t)) {
+                const serial = (await this._adb(['shell', 'getprop', 'ro.serialno'], t)).out.trim();
+                if (serial)
+                    this._serials.set(t, serial);
+            }
+            found.push(t);
         }
+        for (const t of this._serials.keys()) {
+            if (!found.includes(t))
+                this.forget(t);
+        }
+        return found.sort((a, b) => isUsb(b) - isUsb(a));
+    }
+
+    /** Verbindungen zum Tablet, USB zuerst. */
+    async transports() {
+        const want = this._settings.get_string('tablet-serial').trim();
+        const found = (await this._online()).filter(t => !want || this._serials.get(t) === want);
         if (!want && found.length) {
             // ohne Vorgabe: erstes Gerät, auch über WLAN dasselbe
             const s = this._serials.get(found[0]);
-            return found.filter(t => this._serials.get(t) === s).sort((a, b) => isUsb(b) - isUsb(a));
+            return found.filter(t => this._serials.get(t) === s);
         }
-        return found.sort((a, b) => isUsb(b) - isUsb(a));
+        return found;
+    }
+
+    serialOf(t) {
+        return this._serials.get(t) || t;
+    }
+
+    async transportOf(serial) {
+        return (await this._online()).find(t => this.serialOf(t) === serial) ?? null;
+    }
+
+    /** IPv4-Adresse des Tablets bei einer WLAN-Verbindung („ip:port“ oder mDNS-Name). */
+    async ipOf(t) {
+        const direct = t.match(/^(\d+\.\d+\.\d+\.\d+):\d+$/)?.[1];
+        if (direct)
+            return direct;
+        const name = t.split('._adb')[0];
+        const r = await this._adb(['mdns', 'services'], null, {timeout: 5});
+        for (const line of r.out.split('\n')) {
+            const f = line.trim().split(/\s+/);
+            const ip = f[0] === name ? f.at(-1).match(/^(\d+\.\d+\.\d+\.\d+):/)?.[1] : null;
+            if (ip)
+                return ip;
+        }
+        const own = await this._adb(['shell', 'ip', '-4', '-o', 'addr', 'show', 'wlan0'], t, {timeout: 5});
+        return own.out.match(/inet\s+([\d.]+)\//)?.[1] ?? null;
     }
 
     async connectWireless() {
@@ -86,7 +133,11 @@ export class Adb {
     async _ventoPkg(t) {
         if (!this._vento.has(t)) {
             const r = await this._adb(['shell', 'pm', 'list', 'packages'], t);
-            this._vento.set(t, VENTO_PKGS.find(p => r.out.split('\n').includes(`package:${p}`)) ?? null);
+            const lines = r.out.split('\n').map(l => l.trim());
+            const pkg = VENTO_PKGS.find(p => lines.includes(`package:${p}`));
+            if (!pkg)
+                return null;
+            this._vento.set(t, pkg);
         }
         return this._vento.get(t);
     }
@@ -104,10 +155,8 @@ export class Adb {
         const m = (await this._read(t, pkg, 'connections.xml')).match(/name="list">([\s\S]*?)<\/string>/);
         if (!m)
             return null;
-        const unescape = s => s.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-            .replace(/&#10;/g, '\n').replace(/&amp;/g, '&');
         try {
-            return JSON.parse(unescape(m[1]));
+            return JSON.parse(unescapeXml(m[1]));
         } catch {
             return null;
         }
@@ -125,45 +174,35 @@ export class Adb {
         const addr = `${laptopIp}:3389`;
         const want = {...usb, id: WLAN_ID, name: `${usb.name} (WLAN)`, address: addr};
         const cur = conns.find(c => c.id === WLAN_ID);
-        let hosts = await this._read(t, pkg, 'known_hosts.xml');
-        const needHost = fingerprint && !hosts.includes(`name="${addr}"`);
+        const hosts = new Map([...(await this._read(t, pkg, 'known_hosts.xml'))
+            .matchAll(/<string name="([^"]*)">([^<]*)<\/string>/g)].map(m => [unescapeXml(m[1]), unescapeXml(m[2])]));
+        const needHost = fingerprint && hosts.get(addr) !== fingerprint.toLowerCase();
         if (JSON.stringify(cur) === JSON.stringify(want) && !needHost)
             return WLAN_ID;
         await this._adb(['shell', 'am', 'force-stop', pkg], t);
         const list = conns.filter(c => c.id !== WLAN_ID).concat([want]);
-        const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-        await this._write(t, pkg, 'connections.xml',
-            `<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>\n    <string name="list">${esc(JSON.stringify(list))}</string>\n</map>\n`);
+        await this._write(t, pkg, 'connections.xml', prefsXml(new Map([['list', JSON.stringify(list)]])));
         if (needHost) {
-            hosts ||= "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>\n</map>\n";
-            hosts = hosts.replace('</map>', `    <string name="${addr}">${fingerprint.toLowerCase()}</string>\n</map>`);
-            await this._write(t, pkg, 'known_hosts.xml', hosts);
+            hosts.set(addr, fingerprint.toLowerCase());
+            await this._write(t, pkg, 'known_hosts.xml', prefsXml(hosts));
         }
         return WLAN_ID;
     }
 
-    async usbConnectionId(t) {
-        const pkg = await this._ventoPkg(t);
-        const conns = pkg ? await this._connections(t, pkg) : null;
-        return conns?.find(c => c.address === USB_ADDR)?.id ?? null;
-    }
-
-    /** Fehler in Ventos Kabel-Verbindung, die die Anmeldung scheitern lassen; null, wenn alles passt
-     *  oder sich nichts prüfen lässt. */
-    async usbConnectionProblem(t, user) {
-        if (this._settings.get_string('tablet-app') !== 'vento')
-            return null;
+    async usbConnection(t, user) {
         const pkg = await this._ventoPkg(t);
         const conns = pkg ? await this._connections(t, pkg) : null;
         const c = conns?.find(x => x.address === USB_ADDR);
         if (!c)
-            return null;
+            return {id: null, problem: null};
         const fixes = [];
-        if (c.backend !== 'freerdp')
-            fixes.push('Backend „FreeRDP“ wählen');
-        if (user && (c.user ?? '') !== user)
-            fixes.push(`Benutzer „${user}“ eintragen`);
-        return fixes.length ? `Verbindung „${c.name}“ (${USB_ADDR}): ${fixes.join(', ')}.` : null;
+        if (this._settings.get_string('tablet-app') === 'vento') {
+            if (c.backend !== 'freerdp')
+                fixes.push('Backend „FreeRDP“ wählen');
+            if (user && (c.user ?? '') !== user)
+                fixes.push(`Benutzer „${user}“ eintragen`);
+        }
+        return {id: c.id, problem: fixes.length ? `Verbindung „${c.name}“ (${USB_ADDR}): ${fixes.join(', ')}.` : null};
     }
 
     /** App auf dem Tablet öffnen; bei Vento wenn möglich direkt die Verbindung starten. */
